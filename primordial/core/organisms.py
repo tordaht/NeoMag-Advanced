@@ -30,18 +30,25 @@ class SpecimenManager:
         # Behavioral Counters & Timers
         self.mimic_timer = ti.field(dtype=ti.f32, shape=cfg.MAX_AGENTS)
         self.altruism_timer = ti.field(dtype=ti.f32, shape=cfg.MAX_AGENTS)
+        self.mimic_cooldown = ti.field(dtype=ti.f32, shape=cfg.MAX_AGENTS)
+        self.mimic_failure_streak = ti.field(dtype=ti.i32, shape=cfg.MAX_AGENTS)
         self.mimic_attempts = ti.field(dtype=ti.i32, shape=())
         self.mimic_success = ti.field(dtype=ti.i32, shape=())
+        self.mimic_cooldown_blocks = ti.field(dtype=ti.i32, shape=())
         self.altruism_events = ti.field(dtype=ti.i32, shape=())
         self.altruism_transfer_amount = ti.field(dtype=ti.f32, shape=())
         self.altruism_recipient_count = ti.field(dtype=ti.i32, shape=())
         self.altruism_donor_loss = ti.field(dtype=ti.f32, shape=())
         self.altruism_kin_reward = ti.field(dtype=ti.f32, shape=())
         self.mimic_signal_cost_total = ti.field(dtype=ti.f32, shape=())
+        self.mimic_spam_penalty_total = ti.field(dtype=ti.f32, shape=())
         self.visibility_accum = ti.field(dtype=ti.f32, shape=())
         self.visibility_samples = ti.field(dtype=ti.i32, shape=())
         self.alien_mismatch_accum = ti.field(dtype=ti.f32, shape=())
         self.viscosity_drag_accum = ti.field(dtype=ti.f32, shape=())
+        self.signal_anomaly_accum = ti.field(dtype=ti.f32, shape=())
+        self.territorial_pressure_accum = ti.field(dtype=ti.f32, shape=())
+        self.territorial_pressure_energy_loss = ti.field(dtype=ti.f32, shape=())
         
         # RL Tensors (ti.ndarray for explicit bridge)
         self.observations = ti.ndarray(dtype=ti.f32, shape=(cfg.MAX_AGENTS, cfg.OBSERVATION_DIM)) 
@@ -68,18 +75,25 @@ class SpecimenManager:
         self.age.fill(0.0)
         self.mimic_timer.fill(0.0)
         self.altruism_timer.fill(0.0)
+        self.mimic_cooldown.fill(0.0)
+        self.mimic_failure_streak.fill(0)
         self.mimic_attempts[None] = 0
         self.mimic_success[None] = 0
+        self.mimic_cooldown_blocks[None] = 0
         self.altruism_events[None] = 0
         self.altruism_transfer_amount[None] = 0.0
         self.altruism_recipient_count[None] = 0
         self.altruism_donor_loss[None] = 0.0
         self.altruism_kin_reward[None] = 0.0
         self.mimic_signal_cost_total[None] = 0.0
+        self.mimic_spam_penalty_total[None] = 0.0
         self.visibility_accum[None] = 0.0
         self.visibility_samples[None] = 0
         self.alien_mismatch_accum[None] = 0.0
         self.viscosity_drag_accum[None] = 0.0
+        self.signal_anomaly_accum[None] = 0.0
+        self.territorial_pressure_accum[None] = 0.0
+        self.territorial_pressure_energy_loss[None] = 0.0
         
         for i in range(cfg.INITIAL_PREY_COUNT + cfg.INITIAL_PRED_COUNT):
             self.alive[i] = 1
@@ -100,19 +114,26 @@ class SpecimenManager:
         """Resets periodic metrics counters. Expected by world orchestrator."""
         self.mimic_attempts[None] = 0
         self.mimic_success[None] = 0
+        self.mimic_cooldown_blocks[None] = 0
         self.altruism_events[None] = 0
         self.altruism_transfer_amount[None] = 0.0
         self.altruism_recipient_count[None] = 0
         self.altruism_donor_loss[None] = 0.0
         self.altruism_kin_reward[None] = 0.0
         self.mimic_signal_cost_total[None] = 0.0
+        self.mimic_spam_penalty_total[None] = 0.0
         self.visibility_accum[None] = 0.0
         self.visibility_samples[None] = 0
         self.alien_mismatch_accum[None] = 0.0
         self.viscosity_drag_accum[None] = 0.0
+        self.signal_anomaly_accum[None] = 0.0
+        self.territorial_pressure_accum[None] = 0.0
+        self.territorial_pressure_energy_loss[None] = 0.0
 
     def get_culture_metrics(self) -> dict:
         visibility_samples = max(1, int(self.visibility_samples[None]))
+        alive_np = self.alive.to_numpy() == 1
+        streak_np = self.mimic_failure_streak.to_numpy()
         counts = self._get_cultural_counts_kernel()
         return {
             "emerald_count": int(counts[0]),
@@ -121,7 +142,9 @@ class SpecimenManager:
             "mimic_attempts": int(self.mimic_attempts[None]),
             "mimic_success": int(self.mimic_success[None]),
             "mimic_success_rate": float(self.mimic_success[None] / max(1, self.mimic_attempts[None])),
+            "mimic_cooldown_blocks": int(self.mimic_cooldown_blocks[None]),
             "mimic_signal_cost_total": float(self.mimic_signal_cost_total[None]),
+            "mimic_spam_penalty_total": float(self.mimic_spam_penalty_total[None]),
             "altruism_events": int(self.altruism_events[None]),
             "altruism_transfer_amount": float(self.altruism_transfer_amount[None]),
             "altruism_recipient_count": int(self.altruism_recipient_count[None]),
@@ -132,6 +155,10 @@ class SpecimenManager:
             "avg_visibility": float(self.visibility_accum[None] / visibility_samples),
             "avg_alien_mismatch": float(self.alien_mismatch_accum[None] / visibility_samples),
             "avg_culture_drag": float(self.viscosity_drag_accum[None] / visibility_samples),
+            "avg_signal_anomaly": float(self.signal_anomaly_accum[None] / visibility_samples),
+            "avg_territorial_pressure": float(self.territorial_pressure_accum[None] / visibility_samples),
+            "territorial_pressure_energy_loss": float(self.territorial_pressure_energy_loss[None]),
+            "avg_mimic_failure_streak": float(streak_np[alive_np].mean()) if int(alive_np.sum()) > 0 else 0.0,
         }
 
     @ti.func
@@ -161,7 +188,8 @@ class SpecimenManager:
     def _kin_similarity(self, idx_a: int, idx_b: int) -> float:
         epi = self._epigenetic_similarity(idx_a, idx_b)
         culture = self._culture_similarity(idx_a, idx_b)
-        return ti.math.clamp(epi * cfg.KIN_EPIGENETIC_WEIGHT + culture * cfg.KIN_CULTURE_WEIGHT, 0.0, 1.0)
+        combined = epi * cfg.KIN_EPIGENETIC_WEIGHT + culture * cfg.KIN_CULTURE_WEIGHT
+        return ti.min(1.0, ti.max(0.0, combined))
 
     @ti.func
     def _visibility_decay(self, rho: float, dist: float) -> float:
@@ -283,9 +311,18 @@ class SpecimenManager:
                 fields.culture[ix, iy] += self.dialect_state[i] * (passive_deposit + active_deposit)
                 
                 local_culture = fields.culture[ix, iy]
-                local_mean = local_culture.normalized() if local_culture.norm() > 0.01 else self.dialect_state[i]
+                neighborhood_culture = ti.Vector([0.0, 0.0, 0.0])
+                neighborhood_samples = 0.0
+                for fx, fy in ti.static(ti.ndrange((-cfg.ALIEN_PRESSURE_RADIUS, cfg.ALIEN_PRESSURE_RADIUS + 1), (-cfg.ALIEN_PRESSURE_RADIUS, cfg.ALIEN_PRESSURE_RADIUS + 1))):
+                    sample_x = (ix + fx) % cfg.FIELD_RES[0]
+                    sample_y = (iy + fy) % cfg.FIELD_RES[1]
+                    neighborhood_culture += fields.culture[sample_x, sample_y]
+                    neighborhood_samples += 1.0
+                neighborhood_culture /= neighborhood_samples
+                effective_culture = local_culture * (1.0 - cfg.ALIEN_PRESSURE_NEIGHBOR_BLEND) + neighborhood_culture * cfg.ALIEN_PRESSURE_NEIGHBOR_BLEND
+                local_mean = effective_culture.normalized() if effective_culture.norm() > 0.01 else self.dialect_state[i]
                 self.local_marker_ctx[i] = local_culture
-                local_culture_strength = ti.math.tanh(local_culture.norm() * cfg.ALIEN_VISCOSITY_FIELD_WEIGHT)
+                local_culture_strength = ti.math.tanh(effective_culture.norm() * cfg.ALIEN_VISCOSITY_FIELD_WEIGHT)
                 
                 adopt_rate = cfg.DIALECT_ADOPT_RATE
                 gx, gy = int(self.pos[i].x // cfg.SPATIAL_GRID_CELL_SIZE), int(self.pos[i].y // cfg.SPATIAL_GRID_CELL_SIZE)
@@ -298,7 +335,7 @@ class SpecimenManager:
                     neighbors_count = self.grid_count[gx, gy]
 
                 alien_mismatch = 0.0
-                if local_culture.norm() > 0.01:
+                if effective_culture.norm() > 0.01:
                     alien_mismatch = 1.0 - ti.math.clamp(
                         self.dialect_state[i].dot(local_mean) / (self._safe_norm3(self.dialect_state[i]) * self._safe_norm3(local_mean)),
                         0.0,
@@ -307,8 +344,15 @@ class SpecimenManager:
                 m_alien = alien_mismatch * local_culture_strength
                 velocity_scale = 1.0 / (1.0 + cfg.ALIEN_VISCOSITY_GAMMA * m_alien)
                 self.vel[i] *= velocity_scale
-                ti.atomic_add(self.alien_mismatch_accum[None], alien_mismatch)
+                territorial_energy_tax = cfg.TERRITORIAL_PRESSURE_ENERGY_TAX * m_alien * (1.0 + thrust * 0.5)
+                self.energy[i] -= territorial_energy_tax
+                rewards[i] -= territorial_energy_tax * 0.1
+                signal_anomaly = (fields.active_signal[ix, iy] * cfg.SIGNAL_ANOMALY_ACTIVE_WEIGHT + fields.prey_quorum[ix, iy] * cfg.SIGNAL_ANOMALY_PREY_WEIGHT) * m_alien
+                ti.atomic_add(self.alien_mismatch_accum[None], m_alien)
                 ti.atomic_add(self.viscosity_drag_accum[None], 1.0 - velocity_scale)
+                ti.atomic_add(self.signal_anomaly_accum[None], ti.math.clamp(signal_anomaly, 0.0, 1.0))
+                ti.atomic_add(self.territorial_pressure_accum[None], m_alien)
+                ti.atomic_add(self.territorial_pressure_energy_loss[None], territorial_energy_tax)
                 
                 # Apply FALSE_SIGNAL_PENALTY if signaling into the void
                 if self.signal[i] > 0.5 and neighbors_count <= 1:
@@ -336,16 +380,27 @@ class SpecimenManager:
                 
                 self.mimic_timer[i] = ti.math.max(0.0, self.mimic_timer[i] - (1.0 / cfg.MIMIC_WINDOW_STEPS))
                 self.altruism_timer[i] = ti.math.max(0.0, self.altruism_timer[i] - (1.0 / 18.0))
+                self.mimic_cooldown[i] = ti.math.max(0.0, self.mimic_cooldown[i] - 1.0)
                 
                 if mimic_action > cfg.MIMIC_THRESHOLD:
-                    ti.atomic_add(self.mimic_attempts[None], 1)
-                    self.mimic_timer[i] = 1.0
-                    adopt_rate_mimic = cfg.MIMIC_BLEND_STRENGTH
-                    self.dialect_state[i] = ( (1.0 - adopt_rate_mimic) * self.dialect_state[i] + adopt_rate_mimic * local_mean ).normalized()
-                    signal_cost = cfg.MIMIC_BASE_COST + cfg.MIMIC_SIGNAL_COST
-                    self.energy[i] -= signal_cost
-                    rewards[i] -= cfg.MIMIC_COST_BETA * signal_cost
-                    ti.atomic_add(self.mimic_signal_cost_total[None], signal_cost)
+                    if self.mimic_cooldown[i] > 0.0:
+                        self.energy[i] -= cfg.MIMIC_COOLDOWN_PENALTY
+                        rewards[i] -= cfg.MIMIC_COST_BETA * cfg.MIMIC_COOLDOWN_PENALTY
+                        ti.atomic_add(self.mimic_cooldown_blocks[None], 1)
+                    else:
+                        ti.atomic_add(self.mimic_attempts[None], 1)
+                        self.mimic_timer[i] = 1.0
+                        adopt_rate_mimic = cfg.MIMIC_BLEND_STRENGTH
+                        self.dialect_state[i] = ( (1.0 - adopt_rate_mimic) * self.dialect_state[i] + adopt_rate_mimic * local_mean ).normalized()
+                        exp_steps = ti.min(float(self.mimic_failure_streak[i]), cfg.MIMIC_FAILURE_EXP_CAP)
+                        spam_multiplier = ti.pow(cfg.MIMIC_FAILURE_EXP_BASE, exp_steps)
+                        signal_cost = cfg.MIMIC_BASE_COST + cfg.MIMIC_SIGNAL_COST * spam_multiplier
+                        self.energy[i] -= signal_cost
+                        rewards[i] -= cfg.MIMIC_COST_BETA * signal_cost
+                        self.mimic_cooldown[i] = cfg.MIMIC_COOLDOWN_STEPS + exp_steps * 2.0
+                        self.mimic_failure_streak[i] += 1
+                        ti.atomic_add(self.mimic_signal_cost_total[None], signal_cost)
+                        ti.atomic_add(self.mimic_spam_penalty_total[None], signal_cost - (cfg.MIMIC_BASE_COST + cfg.MIMIC_SIGNAL_COST))
                 
                 if altruism_action > cfg.ALTRUISM_THRESHOLD:
                     donor_loss = cfg.ALTRUISM_GIVE_AMOUNT * cfg.ALTRUISM_TAX_MUL
@@ -417,6 +472,8 @@ class SpecimenManager:
                                         if self.mimic_timer[i] > 0.0:
                                             ti.atomic_add(self.mimic_success[None], 1)
                                             rewards[i] += cfg.MIMIC_REWARD_ALPHA * cfg.PRED_FEED_ENERGY
+                                            self.mimic_failure_streak[i] = 0
+                                            self.mimic_cooldown[i] = 0.0
                                         fields.carcasses[ix, iy] += 10.0 
                                         ti.atomic_add(fields.hazard[ix, iy], 0.8) 
                                         self.glow[i] = ti.math.clamp(self.glow[i] + 0.40, 0.0, 1.0)
@@ -463,13 +520,40 @@ class SpecimenManager:
                 observations[i, 8] = fields.hazard[field_x, field_y]
                 observations[i, 9] = fields.thermal[field_x, field_y]
                 
-                cult_val = fields.culture[field_x, field_y]
-                observations[i, 10] = cult_val[0]
-                observations[i, 11] = cult_val[1]
-                observations[i, 12] = cult_val[2]
-                observations[i, 13] = 0.0 # Pad
-                observations[i, 14] = 0.0 # Pad
-                observations[i, 15] = 0.0 # Pad
+                cult_0 = fields.culture[field_x, field_y][0]
+                cult_1 = fields.culture[field_x, field_y][1]
+                cult_2 = fields.culture[field_x, field_y][2]
+                cult_norm = ti.sqrt(cult_0 * cult_0 + cult_1 * cult_1 + cult_2 * cult_2 + 1e-6)
+                cult_affinity = 1.0
+                alien_mismatch = 0.0
+                if cult_norm > 0.01:
+                    inv_norm = 1.0 / cult_norm
+                    mean_0 = cult_0 * inv_norm
+                    mean_1 = cult_1 * inv_norm
+                    mean_2 = cult_2 * inv_norm
+                    dialect_dot = (
+                        self.dialect_state[i][0] * mean_0
+                        + self.dialect_state[i][1] * mean_1
+                        + self.dialect_state[i][2] * mean_2
+                    )
+                    cult_affinity = ti.math.clamp(dialect_dot / self._safe_norm3(self.dialect_state[i]), 0.0, 1.0)
+                    alien_mismatch = 1.0 - cult_affinity
+                signal_anomaly = ti.math.clamp(
+                    (fields.active_signal[field_x, field_y] * cfg.SIGNAL_ANOMALY_ACTIVE_WEIGHT + fields.prey_quorum[field_x, field_y] * cfg.SIGNAL_ANOMALY_PREY_WEIGHT)
+                    * alien_mismatch,
+                    0.0,
+                    1.0,
+                )
+                drag_hint = ti.math.clamp(1.0 / (1.0 + cfg.ALIEN_VISCOSITY_GAMMA * alien_mismatch * ti.math.tanh(cult_norm * cfg.ALIEN_VISCOSITY_FIELD_WEIGHT)), 0.0, 1.0)
+                observations[i, 10] = cult_0
+                observations[i, 11] = cult_1
+                observations[i, 12] = cult_2
+                observations[i, 13] = 0.0
+                observations[i, 14] = 0.0
+                if self.type[i] == cfg.TYPE_PRED:
+                    observations[i, 13] = signal_anomaly
+                    observations[i, 14] = ti.math.clamp(self.mimic_cooldown[i] / cfg.MIMIC_COOLDOWN_STEPS, 0.0, 1.0)
+                observations[i, 15] = 1.0 - drag_hint
                 
                 obs_idx = 16
                 for j in ti.static(range(cfg.EPIGENETIC_DIM)):

@@ -116,6 +116,9 @@ def evaluate_policy(model, seed: int, steps: int = 180):
     total_mimic = 0
     total_altruism = 0
     total_mimic_success = 0
+    total_cooldown_blocks = 0
+    total_drag = 0.0
+    total_anomaly = 0.0
     action_sum = np.zeros(cfg.ACTION_DIM, dtype=np.float64)
     action_steps = 0
 
@@ -128,6 +131,9 @@ def evaluate_policy(model, seed: int, steps: int = 180):
         total_mimic += int(metrics.get("mimic_attempts", 0))
         total_altruism += int(metrics.get("altruism_events", 0))
         total_mimic_success += int(metrics.get("mimic_success", 0))
+        total_cooldown_blocks += int(metrics.get("mimic_cooldown_blocks", 0))
+        total_drag += float(metrics.get("avg_culture_drag", 0.0))
+        total_anomaly += float(metrics.get("avg_signal_anomaly", 0.0))
         alive = env.world.organisms.alive.to_numpy() == 1
         if alive.any():
             action_sum += env.world.organisms.actions.to_numpy()[alive].mean(axis=0)
@@ -144,6 +150,9 @@ def evaluate_policy(model, seed: int, steps: int = 180):
         "alive_count": metrics["alive_count"],
         "avg_energy": float(metrics.get("avg_energy", 0.0)),
         "avg_visibility": float(metrics.get("avg_visibility", 0.0)),
+        "avg_culture_drag": total_drag / max(1, steps),
+        "avg_signal_anomaly": total_anomaly / max(1, steps),
+        "mimic_cooldown_blocks": total_cooldown_blocks,
         "altruism_thermo_gap": float(metrics.get("altruism_thermo_gap", 0.0)),
         "action_activation": (action_sum / max(1, action_steps)).tolist(),
     }
