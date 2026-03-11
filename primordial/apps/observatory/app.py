@@ -1,6 +1,7 @@
 import os
 import random
 import sys
+import threading
 import time
 from collections import deque
 
@@ -30,6 +31,7 @@ else:
         sys.path.append(project_root)
 
 from primordial.core import config as cfg
+from primordial.core.behavior_event_logger import BehaviorEventLogger
 from primordial.core.metrics import MetricsCore
 from primordial.core.ring_buffer import ReplayRingBuffer
 from primordial.core.world import PrimordialWorld
@@ -46,10 +48,16 @@ LENS_ITEMS = [
 
 
 class ObservatoryApp:
+    CHECKPOINT_IDLE_COLOR = (180, 205, 190)
+    CHECKPOINT_BUSY_COLOR = (235, 195, 96)
+    CHECKPOINT_OK_COLOR = (125, 216, 170)
+    CHECKPOINT_ERROR_COLOR = (236, 114, 114)
+
     def __init__(self):
-        self.world = PrimordialWorld(headless=False)
+        self.world = PrimordialWorld(headless=False, capture_behavior_events=True)
         self.world.reset(seed=42)
         self.metrics_engine = MetricsCore()
+        self.event_logger = BehaviorEventLogger(filename=os.path.join(project_root, "behavior_events.csv"))
 
         self.device = torch.device("cpu")
         self.checkpoint_path = os.path.join(project_root, "primordial_ppo_v17.pt")
@@ -65,6 +73,17 @@ class ObservatoryApp:
         )
         self.training_worker = AsyncTrainingWorker(self.actor, self.ring_buffer, self.device, batch_size=16)
         self.last_sync_log_step = -1
+        self.actor_lock = threading.Lock()
+        self.world_lock = threading.Lock()
+        self.metrics_lock = threading.Lock()
+        self.frame_lock = threading.Lock()
+        self.render_state_lock = threading.Lock()
+        self.pending_logs_lock = threading.Lock()
+        self.pending_logs = deque()
+        self.shutdown_event = threading.Event()
+        self.sim_thread = None
+        self.checkpoint_lock = threading.RLock()
+        self.checkpoint_thread = None
 
         self.is_running = False
         self.show_mode = 1
@@ -81,6 +100,20 @@ class ObservatoryApp:
         self.signal_history = deque(maxlen=self.history_len)
         self.log_messages = deque(maxlen=16)
         self.pixel_buffer = np.ones((cfg.WORLD_RES[1], cfg.WORLD_RES[0], 4), dtype=np.float32)
+        self.latest_metrics = self.world.get_metrics()
+        self.metrics_version = 0
+        self.latest_frame = None
+        self.frame_version = 0
+        self.render_request_pending = False
+        self.render_request = (self.show_mode, float(self.cam_pos[0]), float(self.cam_pos[1]), float(self.cam_zoom))
+        self.latest_tps = 0
+        self.latest_fps = 0
+        self.target_render_fps = 30.0
+        self.target_ui_fps = 60.0
+        self.metrics_interval = 0.5
+        self.checkpoint_status_text = "Checkpoint: Hazir"
+        self.checkpoint_status_color = self.CHECKPOINT_IDLE_COLOR
+        self.checkpoint_busy = False
 
         self.setup_ui()
 
@@ -94,15 +127,133 @@ class ObservatoryApp:
                 self.policy_status = f"Checkpoint Error: {exc}"
 
     def save_checkpoint(self, sender=None, app_data=None, user_data=None):
-        torch.save(self.actor.state_dict(), self.checkpoint_path)
-        self.add_log(f"Checkpoint kaydedildi: {self.checkpoint_path}")
+        with self.checkpoint_lock:
+            if self.checkpoint_busy:
+                self.checkpoint_status_text = "Checkpoint: Kayit zaten suruyor..."
+                self.checkpoint_status_color = self.CHECKPOINT_BUSY_COLOR
+                self.queue_log("Checkpoint istegi geldi ama mevcut kayit hala suruyor.")
+                return
+            self.checkpoint_busy = True
+            self.checkpoint_status_text = "Checkpoint: Kaydediliyor..."
+            self.checkpoint_status_color = self.CHECKPOINT_BUSY_COLOR
 
-    def add_log(self, message: str):
-        self.log_messages.appendleft(f"[{self.world.step_count:05d}] {message}")
+        self.queue_log("Checkpoint kaydi baslatildi.")
+        self.checkpoint_thread = threading.Thread(target=self._save_checkpoint_worker, daemon=True, name="CheckpointSaveWorker")
+        self.checkpoint_thread.start()
+
+    def _snapshot_actor_state(self):
+        with self.actor_lock:
+            return {
+                key: value.detach().cpu().clone()
+                for key, value in self.actor.state_dict().items()
+            }
+
+    def _save_checkpoint_worker(self):
+        checkpoint_path = self.checkpoint_path
+        temp_path = f"{checkpoint_path}.tmp"
+        try:
+            state_dict = self._snapshot_actor_state()
+            torch.save(state_dict, temp_path)
+            os.replace(temp_path, checkpoint_path)
+            self.set_checkpoint_status("Checkpoint: Kaydedildi", self.CHECKPOINT_OK_COLOR)
+            self.queue_log(f"Checkpoint kaydedildi: {checkpoint_path}")
+        except Exception as exc:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+            self.set_checkpoint_status(f"Checkpoint Hatasi: {exc}", self.CHECKPOINT_ERROR_COLOR)
+            self.queue_log(f"Checkpoint kaydi basarisiz: {exc}")
+        finally:
+            with self.checkpoint_lock:
+                self.checkpoint_busy = False
+
+    def set_checkpoint_status(self, text: str, color):
+        with self.checkpoint_lock:
+            self.checkpoint_status_text = text
+            self.checkpoint_status_color = color
+
+    def refresh_checkpoint_status(self):
+        with self.checkpoint_lock:
+            text = self.checkpoint_status_text
+            color = self.checkpoint_status_color
+            busy = self.checkpoint_busy
+
+        try:
+            dpg.set_value("checkpoint_state_txt", text)
+            dpg.configure_item("checkpoint_state_txt", color=color)
+            dpg.configure_item("save_checkpoint_btn", enabled=not busy)
+        except Exception:
+            pass
+
+    def queue_log(self, message: str):
+        with self.pending_logs_lock:
+            self.pending_logs.append(message)
+
+    def flush_logs(self):
+        with self.pending_logs_lock:
+            pending = list(self.pending_logs)
+            self.pending_logs.clear()
+
+        if not pending:
+            return
+
+        current_step = int(self.get_latest_metrics().get("step", 0))
+        for message in pending:
+            self.log_messages.appendleft(f"[{current_step:05d}] {message}")
+
         try:
             dpg.set_value("diagnostic_log", "\n".join(self.log_messages))
         except Exception:
             pass
+
+    def add_log(self, message: str):
+        self.queue_log(message)
+        self.flush_logs()
+
+    def get_latest_metrics(self):
+        with self.metrics_lock:
+            return dict(self.latest_metrics)
+
+    def update_latest_metrics(self, metrics):
+        with self.metrics_lock:
+            self.latest_metrics = dict(metrics)
+            self.metrics_version += 1
+
+    def get_metrics_snapshot(self):
+        with self.metrics_lock:
+            return self.metrics_version, dict(self.latest_metrics), int(self.latest_tps)
+
+    def set_latest_tps(self, tps_value: int):
+        with self.metrics_lock:
+            self.latest_tps = int(tps_value)
+
+    def request_render_frame(self):
+        with self.render_state_lock:
+            self.render_request = (self.show_mode, float(self.cam_pos[0]), float(self.cam_pos[1]), float(self.cam_zoom))
+            self.render_request_pending = True
+
+    def get_pending_render_request(self):
+        with self.render_state_lock:
+            if not self.render_request_pending:
+                return None
+            self.render_request_pending = False
+            return self.render_request
+
+    def publish_frame(self, raw_rgb):
+        if raw_rgb is None:
+            return
+        frame = raw_rgb.transpose(1, 0, 2).astype(np.float32, copy=False)
+        with self.frame_lock:
+            self.latest_frame = np.ascontiguousarray(frame)
+            self.frame_version += 1
+
+    def consume_latest_frame(self):
+        with self.frame_lock:
+            if self.latest_frame is None:
+                return self.frame_version, None
+            return self.frame_version, np.copy(self.latest_frame)
 
     def setup_ui(self):
         dpg.create_context()
@@ -121,7 +272,8 @@ class ObservatoryApp:
             with dpg.group(horizontal=True, tag="HUD_Header"):
                 dpg.add_button(label="Play / Pause", callback=self.toggle_sim)
                 dpg.add_button(label="Reset", callback=self.reset_sim)
-                dpg.add_button(label="Save Checkpoint", callback=self.save_checkpoint)
+                dpg.add_button(label="Save Checkpoint", callback=self.save_checkpoint, tag="save_checkpoint_btn")
+                dpg.add_text(self.checkpoint_status_text, tag="checkpoint_state_txt", color=self.checkpoint_status_color)
                 dpg.add_spacer(width=18)
                 dpg.add_text("Lens")
                 dpg.add_combo(LENS_ITEMS, default_value=LENS_ITEMS[1], width=190, callback=self.set_lens)
@@ -171,13 +323,22 @@ class ObservatoryApp:
         dpg.set_primary_window("Main", True)
         dpg.setup_dearpygui()
         dpg.show_viewport()
+        self.refresh_checkpoint_status()
 
     def toggle_sim(self, sender=None, app_data=None, user_data=None):
         self.is_running = not self.is_running
         self.last_interaction_time = time.perf_counter()
+        self.add_log("Simulasyon devam ediyor." if self.is_running else "Simulasyon duraklatildi.")
 
     def reset_sim(self, sender=None, app_data=None, user_data=None):
-        self.world.reset(seed=42)
+        self.is_running = False
+        with self.world_lock:
+            self.world.reset(seed=42)
+            self.update_latest_metrics(self.world.get_metrics())
+        self.step_history.clear()
+        self.pop_history.clear()
+        self.reward_history.clear()
+        self.signal_history.clear()
         self.add_log("Ekosistem sifirlandi.")
         self.last_interaction_time = time.perf_counter()
 
@@ -219,19 +380,19 @@ class ObservatoryApp:
         dpg.set_value("avg_energy_txt", f"Avg Energy: {metrics.get('avg_energy', 0.0):.2f}")
         dpg.set_value("signal_activity_txt", f"Signal Activity: {metrics.get('signal_activity', 0.0):.3f}")
         if mimic_attempts == 0 and mimic_success == 0:
-            dpg.set_value("mimic_txt", "Mimic: Experimental / Inactive")
+            dpg.set_value("mimic_txt", "Mimic: behavior hook present, live activity not yet observed")
         else:
             dpg.set_value("mimic_txt", f"Mimic Success: {mimic_success} / {mimic_attempts}")
 
         if altruism_events <= 0 and transfer_amount <= 0.0:
-            dpg.set_value("altruism_txt", "Altruism: Experimental / Inactive")
+            dpg.set_value("altruism_txt", "Altruism: behavior hook present, live activity not yet observed")
         else:
             dpg.set_value("altruism_txt", f"Altruism Rate: {transfer_rate:.2f}")
 
         stats = self.training_worker.last_stats
-        dpg.set_value("inference_txt", "Inference: Sync Policy Step")
-        dpg.set_value("training_mode_txt", "Training Loop: Async PPO-lite")
-        dpg.set_value("bridge_txt", "Bridge: Taichi World -> CPU Replay")
+        dpg.set_value("inference_txt", "Inference: Background Sim Thread")
+        dpg.set_value("training_mode_txt", "Training Loop: Async PPO-lite Worker")
+        dpg.set_value("bridge_txt", "Bridge: Taichi -> CPU Replay | Render: Throttled Snapshot")
         dpg.set_value("worker_step_txt", f"Worker Step: {self.training_worker.train_step}")
         dpg.set_value("optimizer_step_txt", f"Optimizer Step: {int(stats.get('optimizer_step', 0.0))}")
         dpg.set_value("loss_txt", f"Loss: {stats.get('loss', 0.0):.3f}")
@@ -247,7 +408,8 @@ class ObservatoryApp:
 
     def collect_rollout(self):
         obs_tensor = self.world.get_observations_torch(device=self.device)
-        sample = self.actor.sample_actions(obs_tensor)
+        with self.actor_lock:
+            sample = self.actor.sample_actions(obs_tensor)
         self.world.step(sample.sampled_action)
         rollout = {
             "action_mean": sample.action_mean.cpu().numpy().astype(np.float32, copy=False),
@@ -256,58 +418,120 @@ class ObservatoryApp:
         }
         self.ring_buffer.add(self.world.get_ring_buffer_data(rollout))
 
-    def run(self):
-        last_render_time = last_metrics_time = last_pacing_time = last_sim_time = time.perf_counter()
-        render_interval = 1.0 / 60.0
-        sim_interval = 1.0 / 18.0
-        fps_counter = 0
+    def simulation_loop(self):
+        last_metrics_time = time.perf_counter()
+        last_tps_time = time.perf_counter()
         tps_counter = 0
 
+        while not self.shutdown_event.is_set():
+            if not self.is_running:
+                now = time.perf_counter()
+                if now - last_tps_time >= 1.0:
+                    self.set_latest_tps(0)
+                    last_tps_time = now
+                    tps_counter = 0
+                time.sleep(0.005)
+                continue
+
+            metrics_snapshot = None
+            with self.world_lock:
+                self.collect_rollout()
+                self.event_logger.log_events(self.world.get_behavior_events())
+                tps_counter += 1
+                now = time.perf_counter()
+                if now - last_metrics_time >= self.metrics_interval:
+                    metrics_snapshot = self.world.get_metrics()
+                    self.metrics_engine.log(metrics_snapshot)
+                    last_metrics_time = now
+
+            if metrics_snapshot is not None:
+                self.update_latest_metrics(metrics_snapshot)
+
+            render_request = self.get_pending_render_request()
+            if render_request is not None:
+                with self.world_lock:
+                    raw_rgb = self.world.render(*render_request)
+                self.publish_frame(raw_rgb)
+
+            now = time.perf_counter()
+            if now - last_tps_time >= 1.0:
+                elapsed = max(now - last_tps_time, 1e-6)
+                self.set_latest_tps(int(round(tps_counter / elapsed)))
+                tps_counter = 0
+                last_tps_time = now
+
+    def start_simulation_thread(self):
+        if self.sim_thread and self.sim_thread.is_alive():
+            return
+        self.sim_thread = threading.Thread(target=self.simulation_loop, daemon=True, name="ObservatorySimulation")
+        self.sim_thread.start()
+
+    def run(self):
+        last_render_time = last_metrics_push_time = last_pacing_time = time.perf_counter()
+        render_interval = 1.0 / self.target_render_fps
+        ui_frame_interval = 1.0 / self.target_ui_fps
+        fps_counter = 0
+        last_metrics_version = -1
+        last_frame_version = -1
+
         self.training_worker.start()
+        self.start_simulation_thread()
         self.add_log("Observatory online. Honest PPO-lite worker active.")
 
         try:
             while dpg.is_dearpygui_running():
-                current_time = time.perf_counter()
+                frame_start = time.perf_counter()
+                current_time = frame_start
                 self.handle_input()
+                self.flush_logs()
+                self.refresh_checkpoint_status()
 
-                if self.training_worker.sync_to_main() and self.training_worker.train_step - self.last_sync_log_step >= 20:
+                with self.actor_lock:
+                    did_sync = self.training_worker.sync_to_main()
+                if did_sync and self.training_worker.train_step - self.last_sync_log_step >= 20:
                     self.add_log("AI agirliklari ana politikaya senkronize edildi.")
                     self.last_sync_log_step = self.training_worker.train_step
 
-                if self.is_running:
-                    while current_time - last_sim_time >= sim_interval:
-                        self.collect_rollout()
-                        tps_counter += 1
-                        last_sim_time += sim_interval
-
-                    if current_time - last_metrics_time >= 0.5:
-                        metrics = self.world.get_metrics()
-                        self.metrics_engine.log(metrics)
-                        self.push_metrics(metrics)
-                        last_metrics_time = current_time
-                        dpg.set_value(
-                            "policy_status_txt",
-                            f"Train {self.training_worker.train_step} | KL {self.training_worker.last_stats.get('approx_kl', 0.0):.4f}",
-                        )
+                metrics_version, metrics, latest_tps = self.get_metrics_snapshot()
+                if metrics_version != last_metrics_version or current_time - last_metrics_push_time >= self.metrics_interval:
+                    self.push_metrics(metrics)
+                    last_metrics_version = metrics_version
+                    last_metrics_push_time = current_time
+                    dpg.set_value(
+                        "policy_status_txt",
+                        f"Train {self.training_worker.train_step} | KL {self.training_worker.last_stats.get('approx_kl', 0.0):.4f}",
+                    )
 
                 if current_time - last_render_time >= render_interval:
-                    raw_rgb = self.world.render(self.show_mode, float(self.cam_pos[0]), float(self.cam_pos[1]), float(self.cam_zoom))
-                    if raw_rgb is not None:
-                        self.pixel_buffer[:, :, :3] = raw_rgb.transpose(1, 0, 2)
-                        dpg.set_value("main_viewport", self.pixel_buffer)
-                    fps_counter += 1
+                    self.request_render_frame()
                     last_render_time = current_time
 
-                if current_time - last_pacing_time >= 1.0:
-                    dpg.set_value("fps_display", f"FPS: {fps_counter}")
-                    dpg.set_value("tps_display", f"TPS: {tps_counter}")
-                    fps_counter = 0
-                    tps_counter = 0
-                    last_pacing_time = current_time
+                frame_version, frame = self.consume_latest_frame()
+                if frame is not None and frame_version != last_frame_version:
+                    self.pixel_buffer[:, :, :3] = frame
+                    dpg.set_value("main_viewport", self.pixel_buffer)
+                    last_frame_version = frame_version
 
                 dpg.render_dearpygui_frame()
+                fps_counter += 1
+
+                if current_time - last_pacing_time >= 1.0:
+                    self.latest_fps = fps_counter
+                    dpg.set_value("fps_display", f"FPS: {self.latest_fps}")
+                    dpg.set_value("tps_display", f"TPS: {latest_tps}")
+                    fps_counter = 0
+                    last_pacing_time = current_time
+
+                elapsed = time.perf_counter() - frame_start
+                if elapsed < ui_frame_interval:
+                    time.sleep(ui_frame_interval - elapsed)
         finally:
+            self.is_running = False
+            self.shutdown_event.set()
+            if self.sim_thread:
+                self.sim_thread.join(timeout=2.0)
+            if self.checkpoint_thread:
+                self.checkpoint_thread.join(timeout=2.0)
             self.training_worker.stop()
             self.metrics_engine.log({"step": "SHUTDOWN", "prey_count": 0, "pred_count": 0, "alive_count": 0})
             dpg.destroy_context()

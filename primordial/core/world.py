@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import taichi as ti
 import torch
@@ -14,7 +15,9 @@ class PrimordialWorld:
     Async-friendly world orchestrator with a stable external data surface.
     """
 
-    def __init__(self, headless=True, seed=42):
+    TRIBE_NAMES = ("emerald", "amber", "indigo")
+
+    def __init__(self, headless=True, seed=42, capture_behavior_events=False):
         if not ti.lang.impl.get_runtime().prog:
             try:
                 ti.init(arch=ti.cuda, device_memory_fraction=0.6, random_seed=seed)
@@ -26,6 +29,8 @@ class PrimordialWorld:
         self.renderer = None if headless else CoreRenderer()
         self.step_count = 0
         self.time = 0.0
+        self.capture_behavior_events = capture_behavior_events
+        self.last_behavior_events = []
 
     def reset(self, seed=None):
         if seed is not None:
@@ -39,11 +44,14 @@ class PrimordialWorld:
         self.organisms.compute_observations(self.fields, self.organisms.observations)
 
     def step(self, actions=None):
+        pre_state = None
         if actions is not None:
             if isinstance(actions, torch.Tensor):
                 action_array = actions.detach().cpu().numpy().astype(np.float32, copy=False)
             else:
                 action_array = np.asarray(actions, dtype=np.float32)
+            if self.capture_behavior_events:
+                pre_state = self._capture_behavior_snapshot(action_array)
             self.organisms.actions.from_numpy(action_array)
 
         self.organisms.reset_step_counters()
@@ -70,6 +78,157 @@ class PrimordialWorld:
 
         self.step_count += 1
         self.time += 0.01
+        if self.capture_behavior_events and pre_state is not None:
+            self.last_behavior_events = self._extract_behavior_events(pre_state)
+        else:
+            self.last_behavior_events = []
+
+    def _capture_behavior_snapshot(self, action_array: np.ndarray):
+        return {
+            "actions": np.array(action_array, copy=True),
+            "alive": self.organisms.alive.to_numpy().astype(np.bool_, copy=False),
+            "type": self.organisms.type.to_numpy().astype(np.int32, copy=False),
+            "energy": self.organisms.energy.to_numpy().astype(np.float32, copy=False),
+            "pos": self.organisms.pos.to_numpy().astype(np.float32, copy=False),
+            "dialect": self.organisms.dialect_state.to_numpy().astype(np.float32, copy=False),
+            "mimic_cooldown": self.organisms.mimic_cooldown.to_numpy().astype(np.float32, copy=False),
+            "active_signal": self.fields.active_signal.to_numpy().astype(np.float32, copy=False),
+            "prey_quorum": self.fields.prey_quorum.to_numpy().astype(np.float32, copy=False),
+            "pred_quorum": self.fields.pred_quorum.to_numpy().astype(np.float32, copy=False),
+            "culture": self.fields.culture.to_numpy().astype(np.float32, copy=False),
+        }
+
+    def _dominant_tribes(self, dialect_np: np.ndarray):
+        dominant = np.argmax(dialect_np, axis=1)
+        return np.asarray([self.TRIBE_NAMES[int(idx)] for idx in dominant], dtype=object)
+
+    def _agent_local_context(self, idx: int, state: dict) -> str:
+        pos = state["pos"][idx]
+        field_x = int(pos[0] * cfg.FIELD_RES[0] / cfg.WORLD_RES[0]) % cfg.FIELD_RES[0]
+        field_y = int(pos[1] * cfg.FIELD_RES[1] / cfg.WORLD_RES[1]) % cfg.FIELD_RES[1]
+        alive = state["alive"]
+        pos_np = state["pos"]
+        dist = np.linalg.norm(pos_np - pos, axis=1)
+        neighbors = int(np.count_nonzero(alive & (dist < cfg.INTERACTION_RADIUS * 2.0))) - 1
+        culture = state["culture"][field_x, field_y]
+        return json.dumps(
+            {
+                "neighbors": max(0, neighbors),
+                "active_signal": float(state["active_signal"][field_x, field_y]),
+                "prey_quorum": float(state["prey_quorum"][field_x, field_y]),
+                "pred_quorum": float(state["pred_quorum"][field_x, field_y]),
+                "culture_norm": float(np.linalg.norm(culture)),
+                "mimic_cooldown": float(state["mimic_cooldown"][idx]),
+            },
+            separators=(",", ":"),
+        )
+
+    def _extract_behavior_events(self, state: dict):
+        post_alive = self.organisms.alive.to_numpy().astype(np.bool_, copy=False)
+        post_energy = self.organisms.energy.to_numpy().astype(np.float32, copy=False)
+        post_rewards = self.organisms.rewards.to_numpy().astype(np.float32, copy=False)
+        tribe_labels = self._dominant_tribes(state["dialect"])
+        pre_alive = state["alive"]
+        pre_type = state["type"]
+        pre_pos = state["pos"]
+        pre_energy = state["energy"]
+        actions = state["actions"]
+
+        events = []
+        dead_prey = set(
+            np.where(pre_alive & (pre_type == cfg.TYPE_PREY) & (~post_alive))[0].astype(int).tolist()
+        )
+
+        mimic_agents = np.where(pre_alive & (pre_type == cfg.TYPE_PRED) & (actions[:, 4] > cfg.MIMIC_THRESHOLD))[0]
+        for agent_id in mimic_agents.astype(int).tolist():
+            context = self._agent_local_context(agent_id, state)
+            reward_delta = float(post_rewards[agent_id])
+            energy_delta = float(post_energy[agent_id] - pre_energy[agent_id])
+            target_id = None
+            target_tribe = ""
+            success = False
+
+            if state["mimic_cooldown"][agent_id] <= 0.0:
+                candidates = [
+                    prey_id
+                    for prey_id in dead_prey
+                    if np.linalg.norm(pre_pos[prey_id] - pre_pos[agent_id]) < cfg.INTERACTION_RADIUS
+                ]
+                if candidates:
+                    target_id = min(candidates, key=lambda prey_id: np.linalg.norm(pre_pos[prey_id] - pre_pos[agent_id]))
+                    target_tribe = str(tribe_labels[target_id])
+                    success = True
+                    dead_prey.discard(target_id)
+
+            events.append(
+                {
+                    "step": self.step_count,
+                    "agent_id": agent_id,
+                    "tribe": str(tribe_labels[agent_id]),
+                    "event_type": "mimic",
+                    "target_agent_id": "" if target_id is None else target_id,
+                    "target_tribe": target_tribe,
+                    "local_context": context,
+                    "reward_delta": reward_delta,
+                    "energy_delta": energy_delta,
+                    "success": success,
+                }
+            )
+
+        altruism_agents = np.where(pre_alive & (actions[:, 5] > cfg.ALTRUISM_THRESHOLD))[0]
+        for agent_id in altruism_agents.astype(int).tolist():
+            context = self._agent_local_context(agent_id, state)
+            reward_delta = float(post_rewards[agent_id])
+            energy_delta = float(post_energy[agent_id] - pre_energy[agent_id])
+            candidates = []
+            for other_id in np.where(pre_alive & (pre_type == pre_type[agent_id]))[0].astype(int).tolist():
+                if other_id == agent_id:
+                    continue
+                if np.linalg.norm(pre_pos[other_id] - pre_pos[agent_id]) >= cfg.INTERACTION_RADIUS:
+                    continue
+                if pre_energy[other_id] >= cfg.ALTRUISM_RESCUE_THRESHOLD:
+                    continue
+                if (post_energy[other_id] - pre_energy[other_id]) <= 0.25:
+                    continue
+                candidates.append(other_id)
+
+            if not candidates:
+                events.append(
+                    {
+                        "step": self.step_count,
+                        "agent_id": agent_id,
+                        "tribe": str(tribe_labels[agent_id]),
+                        "event_type": "altruism",
+                        "target_agent_id": "",
+                        "target_tribe": "",
+                        "local_context": context,
+                        "reward_delta": reward_delta,
+                        "energy_delta": energy_delta,
+                        "success": False,
+                    }
+                )
+                continue
+
+            for target_id in candidates:
+                events.append(
+                    {
+                        "step": self.step_count,
+                        "agent_id": agent_id,
+                        "tribe": str(tribe_labels[agent_id]),
+                        "event_type": "altruism",
+                        "target_agent_id": target_id,
+                        "target_tribe": str(tribe_labels[target_id]),
+                        "local_context": context,
+                        "reward_delta": reward_delta,
+                        "energy_delta": energy_delta,
+                        "success": True,
+                    }
+                )
+
+        return events
+
+    def get_behavior_events(self):
+        return list(self.last_behavior_events)
 
     def render(self, show_mode: int, cam_x: float, cam_y: float, zoom: float):
         if self.renderer:
@@ -181,6 +340,8 @@ class PrimordialWorld:
                 metrics[f"cultural_family_{family_idx}_count"] = int(family_total)
                 if family_idx < len(tribe_names):
                     metrics[f"{tribe_names[family_idx]}_count"] = int(family_total)
+                    tribe_mask = dominant == family_idx
+                    metrics[f"{tribe_names[family_idx]}_signal_density"] = float(np.mean(np.abs(signal_np[tribe_mask]))) if np.any(tribe_mask) else 0.0
 
         culture_field = getattr(self.fields, "culture", None)
         if culture_field is not None:
@@ -188,6 +349,8 @@ class PrimordialWorld:
             regional_density = float(np.linalg.norm(culture_np, axis=-1).mean())
             metrics["regional_marker_density"] = regional_density
             metrics["regional_marker_concentration"] = regional_density
+            overlap_mask = np.count_nonzero(culture_np > 0.05, axis=-1) > 1
+            metrics["territorial_overlap"] = float(np.mean(overlap_mask))
         signal_field = getattr(self.fields, "active_signal", None)
         if signal_field is not None:
             active_signal = signal_field.to_numpy()

@@ -1,5 +1,6 @@
 import csv
 import os
+import time
 
 from . import config as cfg
 
@@ -12,7 +13,11 @@ class MetricsCore:
 
     def __init__(self, filename=cfg.METRICS_LOG_FILE):
         self.filename = filename
+        self.session_id = time.strftime("%Y%m%d_%H%M%S")
+        self.log_index = 0
         self.headers = [
+            "session_id",
+            "log_index",
             "step",
             "prey_count",
             "pred_count",
@@ -25,7 +30,9 @@ class MetricsCore:
             "mimic_attempts",
             "mimic_success",
             "mimic_success_rate",
+            "mimic_cooldown_blocks",
             "mimic_signal_cost_total",
+            "mimic_spam_penalty_total",
             "altruism_events",
             "altruism_transfer_amount",
             "altruism_recipient_count",
@@ -36,10 +43,18 @@ class MetricsCore:
             "avg_visibility",
             "avg_alien_mismatch",
             "avg_culture_drag",
+            "avg_signal_anomaly",
+            "avg_territorial_pressure",
+            "territorial_pressure_energy_loss",
+            "avg_mimic_failure_streak",
             "emerald_density",
             "amber_density",
             "indigo_density",
+            "emerald_signal_density",
+            "amber_signal_density",
+            "indigo_signal_density",
             "regional_marker_density",
+            "territorial_overlap",
             "active_signal_density",
         ]
 
@@ -60,7 +75,10 @@ class MetricsCore:
         try:
             with open(self.filename, "a", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
+                self.log_index += 1
                 writer.writerow([
+                    self.session_id,
+                    self.log_index,
                     metrics_dict.get("step", 0),
                     metrics_dict.get("prey_count", 0),
                     metrics_dict.get("pred_count", 0),
@@ -73,7 +91,9 @@ class MetricsCore:
                     metrics_dict.get("mimic_attempts", 0),
                     metrics_dict.get("mimic_success", 0),
                     metrics_dict.get("mimic_success_rate", 0.0),
+                    metrics_dict.get("mimic_cooldown_blocks", 0),
                     metrics_dict.get("mimic_signal_cost_total", 0.0),
+                    metrics_dict.get("mimic_spam_penalty_total", 0.0),
                     metrics_dict.get("altruism_events", 0),
                     metrics_dict.get("altruism_transfer_amount", 0.0),
                     metrics_dict.get("altruism_recipient_count", 0),
@@ -84,10 +104,18 @@ class MetricsCore:
                     metrics_dict.get("avg_visibility", 0.0),
                     metrics_dict.get("avg_alien_mismatch", 0.0),
                     metrics_dict.get("avg_culture_drag", 0.0),
+                    metrics_dict.get("avg_signal_anomaly", 0.0),
+                    metrics_dict.get("avg_territorial_pressure", 0.0),
+                    metrics_dict.get("territorial_pressure_energy_loss", 0.0),
+                    metrics_dict.get("avg_mimic_failure_streak", 0.0),
                     metrics_dict.get("emerald_density", 0.0),
                     metrics_dict.get("amber_density", 0.0),
                     metrics_dict.get("indigo_density", 0.0),
+                    metrics_dict.get("emerald_signal_density", 0.0),
+                    metrics_dict.get("amber_signal_density", 0.0),
+                    metrics_dict.get("indigo_signal_density", 0.0),
                     metrics_dict.get("regional_marker_density", metrics_dict.get("regional_marker_concentration", 0.0)),
+                    metrics_dict.get("territorial_overlap", 0.0),
                     metrics_dict.get("active_signal_density", 0.0),
                 ])
         except Exception as exc:
