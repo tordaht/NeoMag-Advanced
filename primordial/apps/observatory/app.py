@@ -3,6 +3,7 @@ import random
 import sys
 import threading
 import time
+import ctypes
 from collections import deque
 
 import dearpygui.dearpygui as dpg
@@ -52,6 +53,12 @@ class ObservatoryApp:
     CHECKPOINT_BUSY_COLOR = (235, 195, 96)
     CHECKPOINT_OK_COLOR = (125, 216, 170)
     CHECKPOINT_ERROR_COLOR = (236, 114, 114)
+    SIDEBAR_WIDTH = 360
+    OUTER_PADDING = 8
+    HEADER_HEIGHT = 44
+    TREND_HEIGHT = 180
+    RIGHT_TOP_MIN_HEIGHT = 360
+    RIGHT_LOG_MIN_HEIGHT = 220
 
     def __init__(self):
         self.world = PrimordialWorld(headless=False, capture_behavior_events=True)
@@ -114,6 +121,7 @@ class ObservatoryApp:
         self.checkpoint_status_text = "Checkpoint: Hazir"
         self.checkpoint_status_color = self.CHECKPOINT_IDLE_COLOR
         self.checkpoint_busy = False
+        self.viewport_size = (1720, 980)
 
         self.setup_ui()
 
@@ -264,11 +272,20 @@ class ObservatoryApp:
                 dpg.add_font_chars([0x011E, 0x011F, 0x0130, 0x0131, 0x015E, 0x015F, 0x00C7, 0x00E7, 0x00D6, 0x00F6, 0x00DC, 0x00FC])
         dpg.bind_font(default_font)
 
-        dpg.create_viewport(title="Primordial Observatory v17.2", width=1720, height=980)
+        screen_width, screen_height = self.get_screen_size()
+        self.viewport_size = (screen_width, screen_height)
+        dpg.create_viewport(
+            title="Primordial Observatory v17.2",
+            width=screen_width,
+            height=screen_height,
+            x_pos=0,
+            y_pos=0,
+            resizable=True,
+        )
         with dpg.texture_registry():
             dpg.add_raw_texture(cfg.WORLD_RES[0], cfg.WORLD_RES[1], self.pixel_buffer, format=dpg.mvFormat_Float_rgba, tag="main_viewport")
 
-        with dpg.window(tag="Main", no_title_bar=True):
+        with dpg.window(tag="Main", no_title_bar=True, no_move=True, no_resize=True):
             with dpg.group(horizontal=True, tag="HUD_Header"):
                 dpg.add_button(label="Play / Pause", callback=self.toggle_sim)
                 dpg.add_button(label="Reset", callback=self.reset_sim)
@@ -286,12 +303,11 @@ class ObservatoryApp:
 
             dpg.add_separator()
 
-            with dpg.group(horizontal=True):
-                with dpg.child_window(width=1220, height=880, border=False):
-                    dpg.add_image("main_viewport", width=1220, height=705)
-                    with dpg.collapsing_header(label="Diagnostics", default_open=False):
-                        dpg.add_text("", tag="diagnostic_log", wrap=1180)
-                        with dpg.plot(height=145, width=-1):
+            with dpg.group(horizontal=True, tag="content_row"):
+                with dpg.child_window(width=1220, height=880, border=False, tag="left_panel"):
+                    dpg.add_image("main_viewport", width=1220, height=705, tag="viewport_image")
+                    with dpg.child_window(height=170, border=True, tag="trend_panel"):
+                        with dpg.plot(height=-1, width=-1, tag="trend_plot"):
                             dpg.add_plot_axis(dpg.mvXAxis, no_tick_labels=True, tag="trend_x_axis")
                             with dpg.plot_axis(dpg.mvYAxis, tag="trend_y_axis"):
                                 dpg.add_line_series([], [], label="Population", tag="pop_total")
@@ -299,31 +315,91 @@ class ObservatoryApp:
                                 dpg.add_line_series([], [], label="Signal", tag="signal_series")
                             dpg.add_plot_legend()
 
-                with dpg.child_window(width=420, height=880, border=True):
-                    dpg.add_text("Core State", color=(152, 214, 191))
-                    dpg.add_text("Adim: 0", tag="step_counter")
-                    dpg.add_text("Alive: 0", tag="alive_txt")
-                    dpg.add_text("Prey / Pred: 0 / 0", tag="species_txt")
-                    dpg.add_text("Avg Energy: 0.00", tag="avg_energy_txt")
-                    dpg.add_text("Signal Activity: 0.00", tag="signal_activity_txt")
-                    dpg.add_text("Mimic Success: 0 / 0", tag="mimic_txt")
-                    dpg.add_text("Altruism Rate: 0.00", tag="altruism_txt")
-                    dpg.add_separator()
-                    dpg.add_text("Training", color=(227, 201, 130))
-                    dpg.add_text("Inference: Sync Policy Step", tag="inference_txt")
-                    dpg.add_text("Training Loop: Async PPO-lite", tag="training_mode_txt")
-                    dpg.add_text("Bridge: Taichi World -> CPU Replay", tag="bridge_txt")
-                    dpg.add_text("Worker Step: 0", tag="worker_step_txt")
-                    dpg.add_text("Optimizer Step: 0", tag="optimizer_step_txt")
-                    dpg.add_text("Loss: 0.000", tag="loss_txt")
-                    dpg.add_text("Policy / Value: 0.000 / 0.000", tag="policy_value_txt")
-                    dpg.add_text("Entropy: 0.000", tag="entropy_txt")
-                    dpg.add_text("Reward Trend: 0.000", tag="reward_txt")
+                with dpg.child_window(width=self.SIDEBAR_WIDTH, height=880, border=False, tag="right_panel"):
+                    with dpg.child_window(width=-1, height=540, border=True, tag="core_panel"):
+                        dpg.add_text("Core State", color=(152, 214, 191))
+                        dpg.add_text("Adim: 0", tag="step_counter")
+                        dpg.add_text("Alive: 0", tag="alive_txt")
+                        dpg.add_text("Prey / Pred: 0 / 0", tag="species_txt")
+                        dpg.add_text("Avg Energy: 0.00", tag="avg_energy_txt")
+                        dpg.add_text("Signal Activity: 0.00", tag="signal_activity_txt")
+                        dpg.add_text("Mimic Success: 0 / 0", tag="mimic_txt")
+                        dpg.add_text("Altruism Rate: 0.00", tag="altruism_txt")
+                        dpg.add_text("Territorial Pressure: 0.000", tag="territorial_pressure_txt")
+                        dpg.add_text("Culture Drag: 0.000", tag="culture_drag_txt")
+                        dpg.add_text("Signal Anomaly: 0.000", tag="signal_anomaly_txt")
+                        dpg.add_separator()
+                        dpg.add_text("Training", color=(227, 201, 130))
+                        dpg.add_text("Inference: Sync Policy Step", tag="inference_txt")
+                        dpg.add_text("Training Loop: Async PPO-lite", tag="training_mode_txt")
+                        dpg.add_text("Bridge: Taichi World -> CPU Replay", tag="bridge_txt")
+                        dpg.add_text("Worker Step: 0", tag="worker_step_txt")
+                        dpg.add_text("Optimizer Step: 0", tag="optimizer_step_txt")
+                        dpg.add_text("Loss: 0.000", tag="loss_txt")
+                        dpg.add_text("Policy / Value: 0.000 / 0.000", tag="policy_value_txt")
+                        dpg.add_text("Entropy: 0.000", tag="entropy_txt")
+                        dpg.add_text("Reward Trend: 0.000", tag="reward_txt")
+
+                    with dpg.child_window(width=-1, height=300, border=True, tag="diagnostics_panel"):
+                        dpg.add_text("Diagnostics", color=(214, 214, 214))
+                        dpg.add_text("", tag="diagnostic_log", wrap=340)
 
         dpg.set_primary_window("Main", True)
         dpg.setup_dearpygui()
         dpg.show_viewport()
+        self.maximize_viewport()
+        self.apply_responsive_layout(force=True)
         self.refresh_checkpoint_status()
+
+    def get_screen_size(self):
+        try:
+            user32 = ctypes.windll.user32
+            return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+        except Exception:
+            return 1720, 980
+
+    def maximize_viewport(self):
+        try:
+            if hasattr(dpg, "maximize_viewport"):
+                dpg.maximize_viewport()
+        except Exception:
+            pass
+
+    def get_viewport_size(self):
+        width = self.viewport_size[0]
+        height = self.viewport_size[1]
+        try:
+            width = int(dpg.get_viewport_client_width())
+            height = int(dpg.get_viewport_client_height())
+        except Exception:
+            pass
+        return max(width, 1280), max(height, 720)
+
+    def apply_responsive_layout(self, force=False):
+        width, height = self.get_viewport_size()
+        if not force and (width, height) == self.viewport_size:
+            return
+
+        self.viewport_size = (width, height)
+        content_height = max(480, height - self.HEADER_HEIGHT - self.OUTER_PADDING * 3)
+        right_width = min(max(self.SIDEBAR_WIDTH, int(width * 0.19)), 420)
+        left_width = max(700, width - right_width - self.OUTER_PADDING * 4)
+        image_height = max(360, content_height - self.TREND_HEIGHT - self.OUTER_PADDING)
+        right_top_height = max(self.RIGHT_TOP_MIN_HEIGHT, int(content_height * 0.64))
+        right_log_height = max(self.RIGHT_LOG_MIN_HEIGHT, content_height - right_top_height - self.OUTER_PADDING)
+
+        try:
+            dpg.configure_item("Main", width=width, height=height, pos=(0, 0))
+            dpg.configure_item("left_panel", width=left_width, height=content_height)
+            dpg.configure_item("right_panel", width=right_width, height=content_height)
+            dpg.configure_item("viewport_image", width=left_width, height=image_height)
+            dpg.configure_item("trend_panel", width=left_width, height=self.TREND_HEIGHT)
+            dpg.configure_item("trend_plot", width=-1, height=self.TREND_HEIGHT - 12)
+            dpg.configure_item("core_panel", width=right_width, height=right_top_height)
+            dpg.configure_item("diagnostics_panel", width=right_width, height=right_log_height)
+            dpg.configure_item("diagnostic_log", wrap=max(220, right_width - 24))
+        except Exception:
+            pass
 
     def toggle_sim(self, sender=None, app_data=None, user_data=None):
         self.is_running = not self.is_running
@@ -379,6 +455,9 @@ class ObservatoryApp:
         dpg.set_value("species_txt", f"Prey / Pred: {metrics['prey_count']} / {metrics['pred_count']}")
         dpg.set_value("avg_energy_txt", f"Avg Energy: {metrics.get('avg_energy', 0.0):.2f}")
         dpg.set_value("signal_activity_txt", f"Signal Activity: {metrics.get('signal_activity', 0.0):.3f}")
+        dpg.set_value("territorial_pressure_txt", f"Territorial Pressure: {metrics.get('avg_territorial_pressure', 0.0):.3f}")
+        dpg.set_value("culture_drag_txt", f"Culture Drag: {metrics.get('avg_culture_drag', 0.0):.3f}")
+        dpg.set_value("signal_anomaly_txt", f"Signal Anomaly: {metrics.get('avg_signal_anomaly', 0.0):.3f}")
         if mimic_attempts == 0 and mimic_success == 0:
             dpg.set_value("mimic_txt", "Mimic: behavior hook present, live activity not yet observed")
         else:
@@ -485,6 +564,7 @@ class ObservatoryApp:
                 self.handle_input()
                 self.flush_logs()
                 self.refresh_checkpoint_status()
+                self.apply_responsive_layout()
 
                 with self.actor_lock:
                     did_sync = self.training_worker.sync_to_main()

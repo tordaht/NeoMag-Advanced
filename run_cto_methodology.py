@@ -40,6 +40,8 @@ def benchmark_headless_tps(duration_s: float):
     world = PrimordialWorld(headless=True)
     world.reset(seed=42)
     actor = PrimordialPolicy().to("cpu")
+    for _ in range(3):
+        world.step(_sample_action(actor, world))
 
     steps = 0
     start = time.perf_counter()
@@ -62,6 +64,12 @@ def benchmark_ui_open(duration_s: float, target_render_fps: float):
     world_lock = threading.Lock()
     stop_event = threading.Event()
     counters = {"steps": 0, "frames": 0}
+
+    with world_lock:
+        world.step(_sample_action(actor, world))
+        raw = world.render(1, float(cfg.WORLD_RES[0] / 2), float(cfg.WORLD_RES[1] / 2), 1.0)
+        if raw is not None:
+            _ = raw.transpose(1, 0, 2)
 
     def sim_loop():
         while not stop_event.is_set():

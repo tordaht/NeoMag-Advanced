@@ -26,6 +26,37 @@ def _single_agent_world(agent_type=cfg.TYPE_PRED):
     return world
 
 
+def _predator_prey_world():
+    world = PrimordialWorld(headless=True, capture_behavior_events=True)
+    world.reset(seed=123)
+
+    alive = np.zeros(cfg.MAX_AGENTS, dtype=np.int32)
+    alive[0] = 1
+    alive[1] = 1
+    world.organisms.alive.from_numpy(alive)
+
+    types = np.zeros(cfg.MAX_AGENTS, dtype=np.int32)
+    types[0] = cfg.TYPE_PRED
+    types[1] = cfg.TYPE_PREY
+    world.organisms.type.from_numpy(types)
+
+    energy = np.zeros(cfg.MAX_AGENTS, dtype=np.float32)
+    energy[0] = 100.0
+    energy[1] = 40.0
+    world.organisms.energy.from_numpy(energy)
+
+    pos = world.organisms.pos.to_numpy()
+    pos[:] = np.array([305.0, 305.0], dtype=np.float32)
+    pos[1] = np.array([310.0, 305.0], dtype=np.float32)
+    world.organisms.pos.from_numpy(pos)
+
+    dialect = np.zeros((cfg.MAX_AGENTS, cfg.CULTURE_CHANNELS), dtype=np.float32)
+    dialect[0] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    dialect[1] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    world.organisms.dialect_state.from_numpy(dialect)
+    return world
+
+
 def test_mimic_spam_gets_blocked_and_more_expensive():
     world = _single_agent_world(agent_type=cfg.TYPE_PRED)
     actions = np.zeros((cfg.MAX_AGENTS, cfg.ACTION_DIM), dtype=np.float32)
@@ -70,6 +101,30 @@ def test_alien_culture_drag_is_material():
     assert metrics["avg_culture_drag"] > 0.9
     assert metrics["avg_territorial_pressure"] > 0.6
     assert metrics["territorial_pressure_energy_loss"] > 0.05
+
+
+def test_mimic_success_reward_offsets_risk_and_resets_streak():
+    world = _predator_prey_world()
+
+    streak = world.organisms.mimic_failure_streak.to_numpy()
+    streak[0] = 3
+    world.organisms.mimic_failure_streak.from_numpy(streak)
+
+    actions = np.zeros((cfg.MAX_AGENTS, cfg.ACTION_DIM), dtype=np.float32)
+    actions[0, 4] = 1.0
+    world.step(actions)
+
+    metrics = world.get_metrics()
+    rewards = world.organisms.rewards.to_numpy()
+    energy = world.organisms.energy.to_numpy()
+    cooldown = world.organisms.mimic_cooldown.to_numpy()
+    streak_after = world.organisms.mimic_failure_streak.to_numpy()
+
+    assert metrics["mimic_success"] >= 1
+    assert rewards[0] > 20.0
+    assert energy[0] > 150.0
+    assert streak_after[0] == 0
+    assert cooldown[0] == 0.0
 
 
 def test_predator_observation_contains_signal_anomaly_channel():

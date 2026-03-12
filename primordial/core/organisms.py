@@ -346,7 +346,7 @@ class SpecimenManager:
                 self.vel[i] *= velocity_scale
                 territorial_energy_tax = cfg.TERRITORIAL_PRESSURE_ENERGY_TAX * m_alien * (1.0 + thrust * 0.5)
                 self.energy[i] -= territorial_energy_tax
-                rewards[i] -= territorial_energy_tax * 0.1
+                rewards[i] -= territorial_energy_tax * cfg.TERRITORIAL_PRESSURE_REWARD_TAX
                 signal_anomaly = (fields.active_signal[ix, iy] * cfg.SIGNAL_ANOMALY_ACTIVE_WEIGHT + fields.prey_quorum[ix, iy] * cfg.SIGNAL_ANOMALY_PREY_WEIGHT) * m_alien
                 ti.atomic_add(self.alien_mismatch_accum[None], m_alien)
                 ti.atomic_add(self.viscosity_drag_accum[None], 1.0 - velocity_scale)
@@ -471,7 +471,14 @@ class SpecimenManager:
                                         rewards[i] += 15.0 # balanced
                                         if self.mimic_timer[i] > 0.0:
                                             ti.atomic_add(self.mimic_success[None], 1)
-                                            rewards[i] += cfg.MIMIC_REWARD_ALPHA * cfg.PRED_FEED_ENERGY
+                                            success_streak = float(self.mimic_failure_streak[i])
+                                            success_bonus = (
+                                                cfg.MIMIC_SUCCESS_BONUS
+                                                + cfg.MIMIC_REWARD_ALPHA * cfg.PRED_FEED_ENERGY
+                                                + success_streak * cfg.MIMIC_SUCCESS_STREAK_BONUS
+                                            )
+                                            rewards[i] += success_bonus
+                                            self.energy[i] += cfg.MIMIC_SIGNAL_COST * cfg.MIMIC_SUCCESS_COST_REFUND
                                             self.mimic_failure_streak[i] = 0
                                             self.mimic_cooldown[i] = 0.0
                                         fields.carcasses[ix, iy] += 10.0 

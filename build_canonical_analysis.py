@@ -19,7 +19,10 @@ def canonicalize_rows(rows):
     for order, row in enumerate(rows):
         session_id = row.get("session_id") or "legacy"
         log_index = int(row.get("log_index") or order + 1)
-        step = int(float(row.get("step") or 0))
+        try:
+            step = int(float(row.get("step") or 0))
+        except ValueError:
+            continue
         key = (session_id, step)
         row_copy = dict(row)
         row_copy["session_id"] = session_id
